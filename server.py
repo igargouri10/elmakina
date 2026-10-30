@@ -71,7 +71,7 @@ def resolve_action(r):
   log(r,f"{a['name']} collected {amount} tax coins.");return endturn(r)
  if action=='Business Woman':
   log(r,f"{a['name']} collected {banktake(r,a,4)} coins as Business Woman.")
-  q['taxDone']=[];r['phase']='tax';r['passes']=[];return
+  q['taxDone']=[];return tax_window(r)
  if action=='Colonel':
   pay(r,a,4)
   role=q['accused'];match=role in t['cards']
@@ -116,7 +116,8 @@ def public(r,pid):
  if phase=='turn' and me==r['turn']:
   allowed={'actions':ACTIONS}
  if phase=='reaction' and q and alive(p) and me!=q['actor']:
-  allowed={'canChallenge':q['action'] not in ('aid','income','coup') and not q.get('verified',False),'canBlock':q['action'] in BLOCKS and me not in r.get('passes',[]),'canPass':me not in r.get('passes',[])}
+  waiting=me not in r.get('passes',[]) and me not in q.get('taxClaims',[])
+  allowed={'canChallenge':waiting and q['action'] not in ('aid','income','coup') and not q.get('verified',False),'canBlock':waiting and q['action'] in BLOCKS,'canPass':waiting,'canTax':waiting and q['action']=='Business Woman'}
  if phase=='blockReaction' and q and alive(p) and me!=q['blocker']:
   allowed={'canChallenge':True,'canPass':me not in r.get('passes',[])}
  if phase=='loss' and me==r.get('lossPlayer'):allowed={'lose':True}
@@ -125,8 +126,8 @@ def public(r,pid):
  if phase=='politician' and me==q['actor']:allowed={'choose':True}
  if phase=='colonelProof' and me==q['target']:allowed={'exchange':True}
  if phase=='tax' and alive(p) and me!=q['actor'] and me not in q.get('taxDone',[]):allowed={'tax':True,'canPass':me not in r.get('passes',[])}
- if phase=='taxChallenge' and alive(p) and me!=q['taxClaimant']:allowed={'canChallenge':True,'canPass':me not in r.get('passes',[])}
- data={'code':r['code'],'you':pid,'host':r['host'],'started':r['started'],'phase':phase,'round':r['round'],'turn':r['turn'],'bank':r['bank'],'players':[{'id':x['id'],'name':x['name'],'coins':x['coins'],'remaining':len(x['cards']),'connected':bool(x.get('sockets'))} for x in r['players']], 'hand':p['cards'] if r['started'] else [],'log':r['log'][-25:],'pending':None if not q else {k:v for k,v in q.items() if k in ['actor','action','target','accused','blocker','blockRole','taxClaimant','verified']},'allowed':allowed,'lossReason':r.get('lossReason') if phase=='loss' and me==r.get('lossPlayer') else None}
+ if phase=='taxChallenge' and alive(p) and me==q['actor']:allowed={'canChallenge':True,'canPass':True}
+ data={'code':r['code'],'you':pid,'host':r['host'],'started':r['started'],'phase':phase,'round':r['round'],'turn':r['turn'],'bank':r['bank'],'players':[{'id':x['id'],'name':x['name'],'coins':x['coins'],'remaining':len(x['cards']),'connected':bool(x.get('sockets'))} for x in r['players']], 'hand':p['cards'] if r['started'] else [],'log':r['log'][-25:],'pending':None if not q else {k:v for k,v in q.items() if k in ['actor','action','target','accused','blocker','blockRole','taxClaimant','taxClaims','verified']},'allowed':allowed,'chat':r.get('chat',[])[-60:],'diceRounds':r.get('diceRounds',[]) if phase=='dice' else [],'firstPlayer':r.get('firstPlayer'),'diceReady':r.get('diceReady',[]) if phase=='dice' else [],'lossReason':r.get('lossReason') if phase=='loss' and me==r.get('lossPlayer') else None}
  if phase=='police' and me==q['actor']:data['inspectedCard']=player(r,q['target'])['cards'][q['inspected']]
  if phase=='politician' and me==q['actor']:data['choices']=q['choices']
  if phase=='colonelProof' and me==q['target']:data['proofHand']=p['cards']
@@ -145,8 +146,30 @@ def execute(r,pid,msg):
   if r['started'] or pid!=r['host'] or not 2<=len(r['players'])<=10:raise ValueError('Only host can start a game with 2–10 players.')
   r['started']=True;r['deck']=[role for role in ROLES for _ in range(3)];shuffle(r['deck'])
   r['bank']=200-2*len(r['players'])
-  for x in r['players']:x['cards']=[draw(r),draw(r)];x['coins']=2
-  r['turn']=r['players'][0]['id'];r['phase']='turn';log(r,'Game started. All hands are secret.');return
+  hand_size=3 if len(r['players'])==2 else 2
+  for x in r['players']:x['cards']=[draw(r) for _ in range(hand_size)];x['coins']=2
+  # All players roll a fair server-side six-sided die. Tied top rolls reroll until unique.
+  contenders=list(r['players']);rounds=[]
+  while True:
+   rolls={x['id']:secrets.randbelow(6)+1 for x in contenders}
+   rounds.append([{'id':x['id'],'name':x['name'],'roll':rolls[x['id']]} for x in contenders])
+   highest=max(rolls.values());contenders=[x for x in contenders if rolls[x['id']]==highest]
+   if len(contenders)==1:break
+  winner=contenders[0];r['diceRounds']=rounds;r['firstPlayer']=winner['id']
+  r['turn']=winner['id'];r['phase']='dice';r['diceReady']=[]
+  log(r,'Dice rolled to select the first player: '+winner['name']+'.')
+  log(r,f'Game started. {hand_size} private cards each.')
+  return
+ if typ=='dice_ready' and phase=='dice':
+  if pid not in r['diceReady']:r['diceReady'].append(pid)
+  if all(x['id'] in r['diceReady'] for x in r['players']):r['phase']='turn'
+  return
+ if typ=='chat':
+  message=str(msg.get('message','')).strip()[:400]
+  if not message:raise ValueError('Enter a message.')
+  if len(r['chat'])>=100:r['chat']=r['chat'][-99:]
+  r['chat'].append({'player':p['name'],'id':pid,'text':message,'at':int(time.time())})
+  return
  if not r['started']:raise ValueError('Waiting for the host to start.')
  if typ=='action' and phase=='turn' and r['turn']==pid:
   action=msg.get('action');target=msg.get('target');role=msg.get('accused')
@@ -158,21 +181,28 @@ def execute(r,pid,msg):
    if not t or not alive(t) or target==pid:raise ValueError('Choose another living player.')
   else:target=None
   if action=='Colonel' and role not in ROLES:raise ValueError('Choose a role to accuse.')
-  r['pending']={'actor':pid,'action':action,'target':target,'accused':role,'verified':False};r['passes']=[]
+  if action!='Colonel':role=None
+  r['pending']={'actor':pid,'action':action,'target':target,'accused':role,'verified':False,'taxClaims':[],'taxDone':[]};r['passes']=[]
   log(r,f"{p['name']} declared {action}"+(f" against {name(r,target)}" if target else '')+(f" (accusing {role})" if action=='Colonel' else '')+'.')
   if action in ['income','coup']:return resolve_action(r)
   r['phase']='reaction';return
+ if typ=='tax' and phase=='reaction' and q['action']=='Business Woman' and pid!=q['actor'] and alive(p) and pid not in q['taxClaims'] and pid not in r['passes']:
+  q['taxClaims'].append(pid)
+  log(r,f"{p['name']} requested one coin as Tax Agent from {name(r,q['actor'])}.")
+  if reaction_complete(r):resolve_action(r)
+  return
  if typ=='pass' and phase in ['reaction','blockReaction','tax','taxChallenge']:
   if pid==q['actor'] and phase in ['reaction','tax']:raise ValueError('Acting player cannot pass for opponents.')
   if phase=='blockReaction' and pid==q['blocker']:raise ValueError('Blocker cannot pass.')
-  if phase=='taxChallenge' and pid==q['taxClaimant']:raise ValueError('Tax claimant cannot pass.')
+  if phase=='taxChallenge' and pid!=q['actor']:raise ValueError('Only Business Woman chooses to challenge a tax request.')
   if not alive(p):raise ValueError('Eliminated players cannot react.')
   if phase=='tax' and pid in q['taxDone']:raise ValueError('Already claimed tax.')
+  if phase=='reaction' and (pid in r['passes'] or pid in q.get('taxClaims',[])):raise ValueError('You have already responded.')
   r['passes']=list(set(r.get('passes',[])+[pid]))
-  if phase=='reaction':required=[x['id'] for x in r['players'] if alive(x) and x['id']!=q['actor']]
+  if phase=='reaction':required=[x['id'] for x in r['players'] if alive(x) and x['id']!=q['actor'] and x['id'] not in q.get('taxClaims',[])]
   elif phase=='blockReaction':required=[x['id'] for x in r['players'] if alive(x) and x['id']!=q['blocker']]
   elif phase=='tax':required=[x['id'] for x in r['players'] if alive(x) and x['id']!=q['actor'] and x['id'] not in q['taxDone']]
-  else:required=[x['id'] for x in r['players'] if alive(x) and x['id']!=q['taxClaimant']]
+  else:required=[q['actor']]
   if all(x in r['passes'] for x in required):
    if phase=='reaction':resolve_action(r)
    elif phase=='blockReaction':resolve_block(r)
@@ -182,10 +212,13 @@ def execute(r,pid,msg):
  if typ=='challenge' and phase in ('reaction','blockReaction','taxChallenge'):
   if not alive(p):raise ValueError('Eliminated players cannot challenge.')
   if phase=='reaction':
+   if pid in r['passes'] or pid in q.get('taxClaims',[]):raise ValueError('You have already responded.')
    if q['action'] in ('aid','income','coup') or q.get('verified') or pid==q['actor']:raise ValueError('This claim cannot be challenged.')
    claimant=q['actor'];role=q['action']
   elif phase=='blockReaction':claimant=q['blocker'];role=q['blockRole']
-  else:claimant=q['taxClaimant'];role='Tax Agent'
+  else:
+   if pid!=q['actor']:raise ValueError('Only Business Woman can challenge these Tax Agent claims.')
+   claimant=q['taxClaimant'];role='Tax Agent'
   if pid==claimant:raise ValueError('Cannot challenge yourself.')
   claimant_p=player(r,claimant);truth=role in claimant_p['cards']
   log(r,f"{p['name']} challenged {claimant_p['name']}'s {role}: {'TRUTH' if truth else 'BLUFF'}.")
@@ -242,10 +275,15 @@ def execute(r,pid,msg):
   log(r,f"{p['name']} claimed Tax Agent to collect one coin from {name(r,q['actor'])}.");return
  raise ValueError('This move is not valid right now.')
 
+def reaction_complete(r):
+ q=r['pending']
+ return all(p['id'] in r['passes'] or p['id'] in q.get('taxClaims',[]) for p in r['players'] if alive(p) and p['id']!=q['actor'])
+
 def tax_window(r):
- r['phase']='tax';r['passes']=[]
- q=r['pending'];remaining=[p for p in r['players'] if alive(p) and p['id']!=q['actor'] and p['id'] not in q['taxDone']]
- if not remaining:endturn(r)
+ q=r['pending'];r['passes']=[]
+ queued=[pid for pid in q.get('taxClaims',[]) if pid not in q['taxDone'] and alive(player(r,pid))]
+ if not queued:return endturn(r)
+ q['taxClaimant']=queued[0];q['taxDone'].append(queued[0]);r['phase']='taxChallenge'
 def pay_tax(r):
  q=r['pending'];a=player(r,q['actor']);t=player(r,q['taxClaimant']);n=transfer(a,t,1)
  log(r,f"{t['name']} collected {n} coin from {a['name']} as tax.");tax_window(r)
@@ -253,7 +291,7 @@ def pay_tax(r):
 def create_room(pid,n):
  code=''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(5))
  while code in rooms:code=''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(5))
- r={'code':code,'host':pid,'players':[{'id':pid,'name':n,'coins':0,'cards':[],'sockets':set()}],'started':False,'deck':[],'bank':200,'turn':pid,'round':1,'phase':'lobby','pending':None,'log':[],'passes':[],'losses':[],'resume':None,'updated':time.time()}
+ r={'code':code,'host':pid,'players':[{'id':pid,'name':n,'coins':0,'cards':[],'sockets':set()}],'started':False,'deck':[],'bank':200,'turn':pid,'round':1,'phase':'lobby','pending':None,'log':[],'passes':[],'losses':[],'resume':None,'updated':time.time(),'chat':[],'diceRounds':[],'diceReady':[],'firstPlayer':None}
  rooms[code]=r;return r
 
 @app.websocket('/ws')
